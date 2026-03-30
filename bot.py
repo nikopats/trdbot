@@ -2,25 +2,19 @@
 Swing Trading Bot — Alpaca Paper Trading
 Strategy: RSI + EMA crossover momentum/mean-reversion hybrid
 Scans S&P 500 universe, picks top setups, manages position sizing for small accounts.
-
-Requirements:
-    pip install alpaca-trade-api pandas numpy requests yfinance
-
-Usage:
-    1. Set your Alpaca paper trading API keys in config.py (or as env vars)
-    2. Run manually or schedule with cron / Task Scheduler once per day after market close
-       e.g. cron: 0 21 * * 1-5 /usr/bin/python3 /path/to/bot.py
 """
 
 import os
+import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import pandas as pd
 import numpy as np
 import yfinance as yf
 import alpaca_trade_api as tradeapi
 
+# Assuming you still have your config file, but note the GitHub Actions tip below!
 from config import (
     ALPACA_API_KEY,
     ALPACA_SECRET_KEY,
@@ -58,29 +52,33 @@ def get_api():
     return tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version="v2")
 
 
-# ── Indicators ────────────────────────────────────────────────────────────────
+# ── Indicators (Updated to Wilder's Smoothing) ────────────────────────────────
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Calculates RSI using Wilder's Smoothing (matches TradingView)."""
     delta = series.diff()
-    gain = delta.clip(lower=0).rolling(period).mean()
-    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    gain = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
 
 def compute_atr(high, low, close, period: int = 14) -> pd.Series:
+    """Calculates ATR using Wilder's Smoothing (matches TradingView)."""
     tr = pd.concat([
         high - low,
         (high - close.shift()).abs(),
         (low - close.shift()).abs(),
     ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+    return tr.ewm(alpha=1/period, adjust=False).mean()
 
 
 def get_indicators(ticker: str) -> dict | None:
     """Download 90 days of daily OHLCV and compute indicators. Returns None on failure."""
     try:
-        df = yf.download(ticker, period="90d", interval="1d", progress=False, auto_adjust=True)
-        if df is None or len(df) < EMA_SLOW + 5:
+        # yf.Ticker is safer than yf.download for single tickers to avoid MultiIndex parsing bugs
+        df = yf.Ticker(ticker).history(period="90d")
+        
+        if df.empty or len(df) < EMA_SLOW + 5:
             return None
 
         df["rsi"] = compute_rsi(df["Close"], RSI_PERIOD)
@@ -110,14 +108,6 @@ def get_indicators(ticker: str) -> dict | None:
 
 # ── Signal scoring ────────────────────────────────────────────────────────────
 def score_long(ind: dict) -> float:
-    """
-    Score a long setup 0–100.
-    Combines:
-      - EMA crossover (fast crosses above slow) → momentum
-      - RSI in sweet spot (40–65) → not overbought, has room
-      - RSI recovering from oversold → mean-reversion entry
-    Returns 0 if no valid signal.
-    """
     score = 0.0
 
     # EMA bullish crossover just happened (or fast > slow and strengthening)
@@ -156,11 +146,6 @@ def passes_filters(ind: dict) -> bool:
 
 # ── Position sizing ───────────────────────────────────────────────────────────
 def compute_shares(equity: float, price: float, atr: float) -> int:
-    """
-    Risk-based sizing: risk RISK_PER_TRADE_PCT of equity per trade.
-    Stop = ATR_STOP_MULTIPLIER × ATR below entry.
-    Also cap at MAX_POSITION_PCT of equity.
-    """
     stop_distance = ATR_STOP_MULTIPLIER * atr
     if stop_distance <= 0:
         return 0
@@ -173,7 +158,6 @@ def compute_shares(equity: float, price: float, atr: float) -> int:
 
 # ── Exit logic ────────────────────────────────────────────────────────────────
 def should_exit(ind: dict) -> bool:
-    """Exit signal: EMA bearish cross OR RSI overbought."""
     ema_cross_down = (ind["prev_ema_fast"] >= ind["prev_ema_slow"]) and (ind["ema_fast"] < ind["ema_slow"])
     return ema_cross_down or ind["rsi"] > RSI_OVERBOUGHT
 
@@ -200,10 +184,15 @@ def run():
 
     # ── Step 1: Exit check on held positions ─────────────────────────────────
     log.info("── Checking exits ──")
+    exited_symbols = set() # CRITICAL FIX: Track queued exit orders
+
     for symbol, pos in positions.items():
         ind = get_indicators(symbol)
+        time.sleep(0.5) # Sleep to avoid yfinance rate limits
+        
         if ind is None:
             continue
+            
         if should_exit(ind):
             qty = abs(int(float(pos.qty)))
             try:
@@ -214,15 +203,16 @@ def run():
                     type="market",
                     time_in_force="day",
                 )
-                log.info(f"  EXIT {symbol} × {qty} @ ~${ind['close']:.2f} | RSI={ind['rsi']:.1f}")
+                exited_symbols.add(symbol)
+                log.info(f"  EXIT QUEUED {symbol} × {qty} @ ~${ind['close']:.2f} | RSI={ind['rsi']:.1f}")
             except Exception as e:
                 log.error(f"  EXIT order failed for {symbol}: {e}")
         else:
             log.info(f"  HOLD {symbol} | RSI={ind['rsi']:.1f} | EMA diff={ind['ema_fast']-ind['ema_slow']:.2f}")
 
-    # Refresh positions after exits
-    positions = {p.symbol: p for p in api.list_positions()}
-    slots_available = MAX_POSITIONS - len(positions)
+    # Calculate actual available slots
+    active_positions_count = len(positions) - len(exited_symbols)
+    slots_available = MAX_POSITIONS - active_positions_count
     log.info(f"── Entry scan | {slots_available} slot(s) available ──")
 
     if slots_available <= 0:
@@ -232,11 +222,15 @@ def run():
     # ── Step 2: Scan watchlist for entries ────────────────────────────────────
     candidates = []
     for ticker in WATCHLIST:
-        if ticker in positions:
+        if ticker in positions and ticker not in exited_symbols:
             continue
+            
         ind = get_indicators(ticker)
+        time.sleep(0.5) # Sleep to avoid yfinance rate limits
+        
         if ind is None or not passes_filters(ind):
             continue
+            
         s = score_long(ind)
         if s > 0:
             ind["score"] = s
@@ -252,7 +246,7 @@ def run():
         if orders_placed >= slots_available:
             break
 
-        # Re-fetch account cash before each order
+        # Re-fetch account cash before each order to ensure accuracy
         account = api.get_account()
         cash = float(account.cash)
         equity = float(account.equity)
@@ -276,12 +270,14 @@ def run():
                 type="market",
                 time_in_force="day",
             )
-            log.info(f"  BUY {ticker} × {shares} @ ~${ind['close']:.2f} | score={ind['score']:.0f} | cost≈${cost:.2f}")
+            log.info(f"  BUY QUEUED {ticker} × {shares} @ ~${ind['close']:.2f} | score={ind['score']:.0f} | cost≈${cost:.2f}")
             orders_placed += 1
+            # Sleep briefly after submitting an order to respect Alpaca's rate limits
+            time.sleep(0.2) 
         except Exception as e:
             log.error(f"  BUY order failed for {ticker}: {e}")
 
-    log.info(f"Done. {orders_placed} order(s) placed.")
+    log.info(f"Done. {orders_placed} entry order(s) placed.")
     log.info("=" * 60)
 
 
