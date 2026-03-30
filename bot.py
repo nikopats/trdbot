@@ -75,11 +75,15 @@ def compute_atr(high, low, close, period: int = 14) -> pd.Series:
 def get_indicators(ticker: str) -> dict | None:
     """Download 90 days of daily OHLCV and compute indicators. Returns None on failure."""
     try:
-        # yf.Ticker is safer than yf.download for single tickers to avoid MultiIndex parsing bugs
         df = yf.Ticker(ticker).history(period="90d")
         
         if df.empty or len(df) < EMA_SLOW + 5:
             return None
+
+        # ── THE FIX: Flatten MultiIndex columns if yfinance returns them ──
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        # ──────────────────────────────────────────────────────────────────
 
         df["rsi"] = compute_rsi(df["Close"], RSI_PERIOD)
         df["ema_fast"] = df["Close"].ewm(span=EMA_FAST, adjust=False).mean()
