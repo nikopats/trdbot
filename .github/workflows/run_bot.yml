@@ -18,7 +18,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: 'pip' # Speeds up the run by caching libraries
+          # Cache line removed to prevent the missing requirements.txt error
 
       - name: Install dependencies
         run: pip install alpaca-trade-api pandas numpy yfinance requests
