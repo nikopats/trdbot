@@ -2,23 +2,23 @@ name: Run Swing Trading Bot
 
 on:
   schedule:
-    # Runs at 21:00 UTC (5pm New York time) every weekday
-    # Adjust if needed: https://crontab.guru
+    # Runs at 21:00 UTC every weekday
     - cron: "0 21 * * 1-5"
   workflow_dispatch: # allows you to trigger manually from GitHub UI
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-
+    
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: 'pip' # Speeds up the run by caching libraries
 
       - name: Install dependencies
         run: pip install alpaca-trade-api pandas numpy yfinance requests
@@ -28,3 +28,11 @@ jobs:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         run: python bot.py
+
+      - name: Upload Bot Logs
+        uses: actions/upload-artifact@v4
+        if: always() # Ensures the log uploads even if the script crashes
+        with:
+          name: trading-bot-log
+          path: bot.log
+          retention-days: 7 # Keeps logs for a week to save space
